@@ -13,29 +13,35 @@ class DrivingClient(DrivingController):
         self.collision_flag = True
         self.sensing_info = None
 
-        # 핸들로 꺽을 수 있는 최대 각도 (abs)
+        # 핸들로 꺽을 수 있는 최대 각도
         self.MAX_STEERING_ANGLE = 50
 
-        # 최대 제한 속도 (Km/h)
-        self.MAX_SPEED = 40
+        # 안전 속도 (Km/h)
+        self.SAFE_SPEED = 65
+
+        # 한계 속도 (Km/h)
+        self.MAX_SPEED = 95
 
         # 장애물을 회피하는 감지 거리 (미터)
-        # 예를 들어 값이 25라면, 25m 이내의 장애물에 대해서만 회피한다.
+        # 예를 들어 이 값이 25라면, 전방 25m 이내의 장애물에 대해서만 회피한다.
         self.OBSTACLE_SENSING_DIST = 25
 
         # 장애물 좌우로부터 떨어져야 하는 거리
-        # 예를 들어 값이 5라면, 장애물의 중심으로부터 좌/우 5m만큼 떨어져서 주행한다.
-        self.OBSTACLE_EVASION_DIST = 5
+        # 예를 들어 이 값이 4라면, 장애물의 중심으로부터 좌/우 4m만큼 떨어져서 주행한다.
+        self.OBSTACLE_EVASION_DIST = 4
 
         # 차량이 중앙선에서 떨어진 거리만큼 핸들을 돌려야 하는데, 얼만큼 돌릴지를 결정하는 인자.
-        # 예를 들어 값이 10이라면, 중앙선에서 10m 떨어져 있으면 핸들을 최대로 꺾고, 0 ~ 10m 사이는 부드럽게 꺾는다.
+        # 예를 들어 이 값이 10이라면, 중앙선에서 10m 떨어져 있으면 핸들을 최대로 꺾고, 0 ~ 10m 사이는 부드럽게 꺾는다.
         self.STEERING_BY_MIDDLE_FACTOR = 10
+
+        # 안전 속도(SAFE_SPEED)보다 고속인 상황에서 steer를 꺽는 각도가 이보다 클 경우, 브레이크를 잡아준다.
+        # 예를 들어 이 값이 20이고, SAFE_SPEED가 60이라면, 속도가 60Km/h 이상이면서 핸들을 꺾는 각도가 20도 이상이면 브레이크를 잡는다.
+        self.SHARP_CURVE_DEG = 20
 
         #
         # Editing area ends
         # ==========================================================#
         super().__init__()
-
 
     def control_driving(self, car_controls, sensing_info):
 
@@ -72,7 +78,7 @@ class DrivingClient(DrivingController):
         car_controls.steering = self.get_steering()
 
         # 브레이크  / 엑셀을 제어한다.
-        car_controls.brake = self.get_brake()
+        car_controls.brake = self.get_brake(car_controls.steering)
         if car_controls.brake > 0:
             car_controls.throttle = 0
         else:
@@ -123,15 +129,56 @@ class DrivingClient(DrivingController):
 
     # ============================
     # 브레이크를 밟을지 말지 결정한다.
-    # TODO all or nothing 방식이 아니라, 부드럽게 밟자.
     # ============================
-    def get_brake(self):
+    def get_brake(self, steering):
         result = 0
-        if self.sensing_info.speed > self.MAX_SPEED:
+
+        # 속도가 20km/h 이하라면 브레이크 밟을 일이 없다.
+        if self.sensing_info.speed < 20:
+            result = 0
+        else:
+            # 20미터 전방 기준, 급커브가 아니고, 전방에 장애물이 없을 경우, 욕심을 내본다.
+            if abs(self.sensing_info.track_forward_angles[1]) < self.SHARP_CURVE_DEG and len(self.filter_obstacles()) == 0:
+                # 20미터 전방 기준으로는 급커브가 아니었지만, 40미터 전방 기준으로 급커브가 있으면 안전속도가 될 때까지 브레이크를 절반만 밟는다.
+                if abs(self.sensing_info.track_forward_angles[3]) > self.SHARP_CURVE_DEG:
+                    result = self.apply_safe_speed() / 2
+                    if self.is_debug:
+                        print("40미터 전방 급커브: {}, Half Break".format(self.sensing_info.track_forward_angles[3]))
+                # 최대 속도를 내보자
+                else:
+                    result = 0
+                    if self.is_debug:
+                        print("20미터 전방 직선도로: {}, Full Speed".format(self.sensing_info.track_forward_angles[1]))
+            else:
+                # 안전 속도에 맞춘다.
+                result = self.apply_safe_speed()
+                if self.is_debug:
+                    print("안전 속도 유지 모드. 현재 속도: {}".format(self.sensing_info.speed))
+
+            # 최종 안전장치 1: 너무 고속에서 핸들을 크게 꺾을 때는 브레이크를 절반 밟아준다.
+            if self.sensing_info.speed > self.SAFE_SPEED and abs(steering) > self.get_steering_by_angle(self.SHARP_CURVE_DEG):
+                if self.is_debug:
+                    print("속도에 비해서 진행 각도 너무 큼. 속도: {}, 진행 각도: {}, Half Break".format(self.sensing_info.speed, steering))
+                result = 0.5
+
+            # 최종 안전장치 2: 아무리 빨라도 최고 속도 이하로 달려야 한다.
+            if self.sensing_info.speed > self.MAX_SPEED:
+                if self.is_debug:
+                    print("최고 속도 이하로 달린다. 속도: {}, Half Break".format(self.sensing_info.speed))
+                result = 0.5
+
+        return result
+
+    # ============================
+    # 안전 속도를 기반으로, 브레이크를 잡을지 말지를 결정
+    # ============================
+    def apply_safe_speed(self):
+        result = 0
+
+        if self.sensing_info.speed > self.SAFE_SPEED:
             result = 1
 
-        # print("브레이크: {}".format(result))
-        return result
+        return result;
 
     # ============================
     # 가장 가까운 장애물을 대상으로, 차량이 장애물의 좌우 몇 미터 지점을 지나가는게 좋을지 계산한다.
@@ -139,9 +186,10 @@ class DrivingClient(DrivingController):
     def get_fixed_middle_distance_from_closest_obstacle(self):
         result = 0
 
-        if len(self.sensing_info.track_forward_obstacles) != 0:
+        obstacles = self.filter_obstacles()
+        if len(obstacles) != 0:
             # 가장 가까운 장애물 하나를 가져온다.
-            closest = self.sensing_info.track_forward_obstacles[0]
+            closest = obstacles[0]
 
             # 너무 멀리 떨어진 장애물에 대해서는 반응하지 않고,
             # 장애물 감지 거리(self.OBSTACLE_SENSING_DIST) 이내의 장애물에 대해서만 회피한다.
@@ -155,6 +203,18 @@ class DrivingClient(DrivingController):
                     print("장애물 발견: {}, 보정값: {}".format(closest, result))
 
         return result
+
+    # ============================
+    # 너무 양 side에 있는 장애물은 무시한다.
+    # ============================
+    def filter_obstacles(self):
+        result = []
+
+        for obstacle in self.sensing_info.track_forward_obstacles:
+            if abs(obstacle['to_middle']) < self.OBSTACLE_EVASION_DIST:
+                result.append(obstacle)
+
+        return result;
 
     # ============================
     # 희망하는 진행 각도(angle)로부터 핸들 꺽는 방향과 힘(steering)을 계산한다.
